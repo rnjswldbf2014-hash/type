@@ -1,4 +1,4 @@
-﻿{
+{
     "name": "rnjswldbf_2014_type",
     "description": "A custom math types library in D",
     "authors": ["권지율"],
@@ -6,4 +6,4 @@
     "targetType": "library",
     "sourcePaths": ["type"],
     "importPaths": ["type"]
-}
+}
