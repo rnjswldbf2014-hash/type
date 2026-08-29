@@ -1,7 +1,7 @@
-{
+﻿{
     "name": "rnjswldbf_2014_type",
-    "description": "A reinforcement learning and custom math types library in D",
-    "authors": ["권�???],
+    "description": "A custom math types library in D",
+    "authors": ["권지율"],
     "license": "GPL-2.0",
     "targetType": "library",
     "sourcePaths": ["type"],
