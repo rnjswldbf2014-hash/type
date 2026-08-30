@@ -1,10 +1,10 @@
-{
-    "name": "rnjswldbf_2014",
-    "description": "A custom math types library in D",
-    "authors": ["沅뚯???],
-    "license": "GPL-2.0",
-    "targetType": "library",
-    "sourcePaths": ["type"],
-    "importPaths": ["type"]
-}
-
+{
+    "name": "rnjswldbf_2014",
+    "description": "A custom math types library in D",
+    "authors": ["권지율"],
+    "license": "GPL-2.0",
+    "targetType": "library",
+    "sourcePaths": ["type"],
+    "importPaths": ["type"]
+}
+
