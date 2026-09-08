@@ -243,10 +243,12 @@ struct posit {
 // Parses one side of an equation into coefficients indexed by power,
 // so "2x^2 - 3x + 1" becomes [1, -3, 2, 0]. Accepts an implicit 1
 // coefficient ("x^2"), an optional '*' ("2*x"), and free whitespace.
-private double[4] parseSide(string expr, char varName) {
+// Coefficients are kept as exact bid values, never routed through a
+// double, so the arbitrary-precision solver starts from exact input.
+private bid[4] parseSide(string expr, char varName) {
     import std.ascii : isAsciiDigit = isDigit;
 
-    double[4] coeffs = [0.0, 0.0, 0.0, 0.0];
+    bid[4] coeffs = [bid(0L), bid(0L), bid(0L), bid(0L)];
     size_t i = 0;
 
     void skipSpaces() {
@@ -260,18 +262,18 @@ private double[4] parseSide(string expr, char varName) {
         skipSpaces();
         if (i >= expr.length) break;
 
-        double sign = 1.0;
+        bool negate = false;
         if (expr[i] == '+') { i++; }
-        else if (expr[i] == '-') { sign = -1.0; i++; }
+        else if (expr[i] == '-') { negate = true; i++; }
         skipSpaces();
 
         // Coefficient, if written out.
-        double coeff = 1.0;
+        bid coeff = bid(1L);
         bool hasCoeff = false;
         size_t start = i;
         while (i < expr.length && (isAsciiDigit(expr[i]) || expr[i] == '.')) i++;
         if (i > start) {
-            coeff = to!double(expr[start .. i]);
+            coeff = bid(expr[start .. i].idup);
             hasCoeff = true;
         }
 
@@ -297,7 +299,8 @@ private double[4] parseSide(string expr, char varName) {
         }
 
         enforce(power <= 3, "Only equations up to degree 3 are supported");
-        coeffs[power] += sign * coeff;
+        if (negate) coeff.negative = !coeff.negative && coeff.coefficient != 0;
+        coeffs[power] = coeffs[power] + coeff;
         skipSpaces();
     }
 
@@ -318,20 +321,29 @@ private string formatComplex(double re, double im) {
     return formatRoot(re) ~ sign ~ formatRoot(abs(im)) ~ "i";
 }
 
+// Reduces an equation to exact coefficients indexed by power, moving any
+// right-hand terms across the '='. Shared by both solvers.
+private bid[4] equationCoeffs(string equation, char v) {
+    auto eqPos = equation.indexOf('=');
+    bid[4] coeffs = parseSide(eqPos == -1 ? equation : equation[0 .. eqPos], v);
+    if (eqPos != -1) {
+        bid[4] rhs = parseSide(equation[eqPos + 1 .. $], v);
+        foreach (idx; 0 .. 4) coeffs[idx] = coeffs[idx] - rhs[idx];
+    }
+    return coeffs;
+}
+
 // Solves a polynomial equation of degree 1-3 in one variable.
 // `varName` is the variable to solve for ("x" if empty); `equation` may
 // carry terms on both sides ("x^2 = 2x + 3") or none on the right.
 // Returns one "<var>: <root>" entry per root, complex roots included.
+// Roots are computed in double precision; see solvePrecise for exact work.
 string[] solve(string varName, string equation) {
     char v = varName.length ? varName[0] : 'x';
 
-    auto eqPos = equation.indexOf('=');
-    double[4] lhs = parseSide(eqPos == -1 ? equation : equation[0 .. eqPos], v);
-    double[4] coeffs = lhs;
-    if (eqPos != -1) {
-        double[4] rhs = parseSide(equation[eqPos + 1 .. $], v);
-        foreach (idx; 0 .. 4) coeffs[idx] -= rhs[idx];
-    }
+    bid[4] exact = equationCoeffs(equation, v);
+    double[4] coeffs;
+    foreach (idx; 0 .. 4) coeffs[idx] = getDouble(exact[idx]);
 
     enum eps = 1e-12;
     string label(string root) { return v ~ ": " ~ root; }
@@ -390,6 +402,244 @@ string[] solve(string varName, string equation) {
     string[] roots;
     foreach (k; 0 .. 3)
         roots ~= label(formatRoot(m * cos(theta - 2.0 * PI * k / 3.0) - shift));
+    return roots;
+}
+
+// 10. Arbitrary-precision equation solving.
+//
+// The double solver above is capped at ~17 significant digits by its own
+// arithmetic. These routines instead work in exact bid/BigInt arithmetic
+// and return roots to as many decimal places as asked for.
+
+BigInt isqrt(BigInt n) {
+    enforce(n >= 0, "isqrt of a negative value");
+    if (n < 2) return n;
+    // Start above the true root so the Newton iteration descends onto it.
+    BigInt x = pow10(cast(int)((n.toDecimalString().length + 2) / 2));
+    BigInt y = (x + n / x) / 2;
+    while (y < x) { x = y; y = (x + n / x) / 2; }
+    return x;
+}
+
+BigInt icbrt(BigInt n) {
+    bool neg = n < 0;
+    if (neg) n = -n;
+    if (n < 2) return neg ? -n : n;
+    BigInt x = pow10(cast(int)((n.toDecimalString().length + 3) / 3));
+    BigInt y = (2 * x + n / (x * x)) / 3;
+    while (y < x) { x = y; y = (2 * x + n / (x * x)) / 3; }
+    return neg ? -x : x;
+}
+
+// Builds a bid from a signed BigInt, restoring the sign/magnitude split
+// the struct expects.
+private bid bidSigned(BigInt v, int exp) {
+    bool neg = v < 0;
+    return bid(neg, neg ? -v : v, exp);
+}
+
+// Rounds to `scale` decimal places, round-half-up. Keeps intermediate
+// values from growing without bound during iteration.
+bid bidRound(bid v, int scale) {
+    if (-v.exponent <= scale) return v;
+    int drop = -v.exponent - scale;
+    BigInt d = pow10(drop);
+    BigInt q = v.coefficient / d;
+    if ((v.coefficient % d) * 2 >= d) q += 1;
+    return bid(v.negative && q != 0, q, -scale);
+}
+
+// Square root to `scale` decimal places, via integer sqrt of the value
+// shifted left by 2*scale digits.
+bid bidSqrt(bid v, int scale) {
+    enforce(!v.negative, "bidSqrt of a negative value");
+    int shift = v.exponent + 2 * scale;
+    BigInt n = v.coefficient;
+    if (shift >= 0) n *= pow10(shift);
+    else n /= pow10(-shift);
+    return bid(false, isqrt(n), -scale);
+}
+
+// Cube root to `scale` decimal places; handles negative input.
+bid bidCbrt(bid v, int scale) {
+    int shift = v.exponent + 3 * scale;
+    BigInt n = v.coefficient;
+    if (shift >= 0) n *= pow10(shift);
+    else n /= pow10(-shift);
+    return bid(v.negative, icbrt(n), -scale);
+}
+
+// Horner evaluation, rounding after each step so the working precision
+// stays bounded instead of tripling with every multiply.
+private bid polyEval(bid[] coeffs, bid x, int scale) {
+    bid acc = bid(0L);
+    foreach_reverse (c; coeffs)
+        acc = bidRound(acc * x + c, scale);
+    return acc;
+}
+
+private bid[] polyDeriv(bid[] coeffs) {
+    bid[] d;
+    foreach (i; 1 .. coeffs.length)
+        d ~= coeffs[i] * bid(cast(long)i);
+    return d;
+}
+
+// Newton refinement of a root, in exact arithmetic. `multiplicity` > 1
+// restores quadratic convergence on repeated roots, where plain Newton
+// would crawl.
+bid refineRoot(bid[] coeffs, bid guess, int multiplicity, int scale) {
+    bid[] deriv = polyDeriv(coeffs);
+    bid x = bidRound(guess, scale);
+    foreach (_; 0 .. 500) {
+        bid fx = polyEval(coeffs, x, scale);
+        bid dfx = polyEval(deriv, x, scale);
+        if (dfx.coefficient == 0) break;
+        bid step = fx.divide(dfx, scale);
+        if (multiplicity > 1) step = step * bid(cast(long)multiplicity);
+        bid next = bidRound(x - step, scale);
+        if ((next - x).coefficient == 0) return next;
+        x = next;
+    }
+    return x;
+}
+
+private string labelRoot(char v, bid value) {
+    return v ~ ": " ~ value.toString();
+}
+
+private string labelComplex(char v, bid re, bid im) {
+    bool negIm = im.negative;
+    bid mag = bid(false, im.coefficient, im.exponent);
+    return v ~ ": " ~ re.toString() ~ (negIm ? " - " : " + ") ~ mag.toString() ~ "i";
+}
+
+// Solves a degree 1-3 equation to `scale` decimal places using exact
+// decimal arithmetic throughout. Same equation syntax as solve().
+//
+// Degree 1, degree 2, and the repeated-root cubics are closed-form and
+// exact. The remaining cubics are seeded from the double solver and then
+// Newton-refined in exact arithmetic, which is what carries them past
+// double's ~17 digits.
+string[] solvePrecise(string varName, string equation, int scale) {
+    enforce(scale >= 0, "scale must not be negative");
+    char v = varName.length ? varName[0] : 'x';
+    int work = scale + 20; // guard digits, trimmed on the way out
+
+    bid[4] c = equationCoeffs(equation, v);
+    bid a3 = c[3], a2 = c[2], a1 = c[1], a0 = c[0];
+
+    bool isZero(bid b) { return b.coefficient == 0; }
+    string outRoot(bid r) { return labelRoot(v, bidRound(r, scale)); }
+
+    if (isZero(a3) && isZero(a2) && isZero(a1))
+        return isZero(a0) ? ["infinitely many solutions"] : ["no solution"];
+
+    // Linear: exact.
+    if (isZero(a3) && isZero(a2)) {
+        bid root = a0.divide(a1, work);
+        root.negative = !root.negative && !isZero(root);
+        return [outRoot(root)];
+    }
+
+    // Quadratic: exact, with an arbitrary-precision square root.
+    if (isZero(a3)) {
+        bid disc = a1 * a1 - bid(4L) * a2 * a0;
+        bid twoA = bid(2L) * a2;
+        bid negB = a1;
+        negB.negative = !negB.negative && !isZero(negB);
+
+        if (isZero(disc)) return [outRoot(negB.divide(twoA, work))];
+
+        if (!disc.negative) {
+            bid sq = bidSqrt(disc, work);
+            return [outRoot((negB + sq).divide(twoA, work)),
+                    outRoot((negB - sq).divide(twoA, work))];
+        }
+        bid re = negB.divide(twoA, work);
+        bid im = bidSqrt(bid(false, disc.coefficient, disc.exponent), work)
+                    .divide(twoA, work);
+        return [labelComplex(v, bidRound(re, scale), bidRound(im, scale)),
+                labelComplex(v, bidRound(re, scale),
+                             bidRound(bidSigned(-im.coefficient, im.exponent), scale))];
+    }
+
+    // Cubic. Classify exactly, then solve each case at full precision.
+    bid disc = bid(18L) * a3 * a2 * a1 * a0
+             - bid(4L) * a2 * a2 * a2 * a0
+             + a2 * a2 * a1 * a1
+             - bid(4L) * a3 * a1 * a1 * a1
+             - bid(27L) * a3 * a3 * a0 * a0;
+    bid b2m3ac = a2 * a2 - bid(3L) * a3 * a1;
+
+    if (isZero(disc)) {
+        // Triple root: x = -a2 / (3*a3), exact.
+        if (isZero(b2m3ac)) {
+            bid root = a2.divide(bid(3L) * a3, work);
+            root.negative = !root.negative && !isZero(root);
+            return [outRoot(root)];
+        }
+        // Double root plus a simple root; both are exact rationals.
+        bid dbl = (bid(9L) * a3 * a0 - a2 * a1).divide(bid(2L) * b2m3ac, work);
+        bid simple = (bid(4L) * a3 * a2 * a1 - bid(9L) * a3 * a3 * a0 - a2 * a2 * a2)
+                        .divide(a3 * b2m3ac, work);
+        return [outRoot(dbl), outRoot(simple)];
+    }
+
+    // Seed every real root from the double solver, then refine exactly.
+    bid[] poly = [a0, a1, a2, a3];
+    double da3 = getDouble(a3), da2 = getDouble(a2),
+           da1 = getDouble(a1), da0 = getDouble(a0);
+    double b = da2 / da3, cc = da1 / da3, d = da0 / da3;
+    double p = cc - b * b / 3.0;
+    double q = 2.0 * b * b * b / 27.0 - b * cc / 3.0 + d;
+    double shift = b / 3.0;
+
+    if (disc.negative) {
+        // One real root, one complex conjugate pair.
+        double sq = sqrt(q * q / 4.0 + p * p * p / 27.0);
+        double seed = cbrt(-q / 2.0 + sq) + cbrt(-q / 2.0 - sq) - shift;
+        bid root = refineRoot(poly, bid(seed), 1, work);
+
+        // Deflate by (x - root) and solve the remaining quadratic exactly.
+        bid q2 = a3;
+        bid q1 = a2 + a3 * root;
+        bid q0 = a1 + root * q1;
+        bid dsc = q1 * q1 - bid(4L) * q2 * q0;
+        bid twoA = bid(2L) * q2;
+        bid negB = q1;
+        negB.negative = !negB.negative && !isZero(negB);
+        bid re = negB.divide(twoA, work);
+        bid im = bidSqrt(bid(false, dsc.coefficient, dsc.exponent), work)
+                    .divide(twoA, work);
+        return [outRoot(root),
+                labelComplex(v, bidRound(re, scale), bidRound(im, scale)),
+                labelComplex(v, bidRound(re, scale),
+                             bidRound(bidSigned(-im.coefficient, im.exponent), scale))];
+    }
+
+    // Three distinct real roots (casus irreducibilis).
+    double m = 2.0 * sqrt(-p / 3.0);
+    double theta = acos(3.0 * q / (2.0 * p) * sqrt(-3.0 / p)) / 3.0;
+    string[] roots;
+    foreach (k; 0 .. 3) {
+        double seed = m * cos(theta - 2.0 * PI * k / 3.0) - shift;
+        roots ~= outRoot(refineRoot(poly, bid(seed), 1, work));
+    }
+    return roots;
+}
+
+// Same as solvePrecise, but hands back the real roots as dpd values so
+// they can be packed into declets or fed into further decimal work.
+dpd[] solveRealRoots(string varName, string equation, int scale) {
+    dpd[] roots;
+    foreach (entry; solvePrecise(varName, equation, scale)) {
+        auto colon = entry.indexOf(": ");
+        if (colon == -1) continue;              // "no solution" and friends
+        string value = entry[colon + 2 .. $];
+        if (value.indexOf('i') != -1) continue; // skip the complex pairs
+        roots ~= dpd(value);
+    }
     return roots;
 }
 
@@ -811,4 +1061,41 @@ unittest {
     bool threw = false;
     try { solve("x", "x^4 = 1"); } catch (Exception) { threw = true; }
     assert(threw);
+
+    // Arbitrary-precision roots, checked against the known expansions.
+    // sqrt(2)  = 1.4142135623730950488016887242096980785696718753769480...
+    // cbrt(2)  = 1.2599210498948731647672106072782283505702514647015079...
+    enum sqrt2_50 = "1.41421356237309504880168872420969807856967187537695";
+    enum cbrt2_50 = "1.25992104989487316476721060727822835057025146470151";
+    assert(solvePrecise("x", "x^2 - 2 = 0", 50) == ["x: " ~ sqrt2_50, "x: -" ~ sqrt2_50]);
+    assert(solvePrecise("x", "x^3 - 2 = 0", 50)[0] == "x: " ~ cbrt2_50);
+
+    // The closed-form path and the integer-root path must agree.
+    assert(bidRound(bidSqrt(bid(2L), 60), 50).toString() == sqrt2_50);
+    assert(bidRound(bidCbrt(bid(2L), 60), 50).toString() == cbrt2_50);
+
+    // A root fed back through exact multiplication reproduces the input.
+    bid r2 = bidSqrt(bid(2L), 60);
+    assert(bidRound(r2 * r2, 55) == bid(2L));
+
+    // Exact rational cases stay exact at any scale.
+    assert(solvePrecise("x", "2x - 1 = 0", 25) == ["x: 0.5000000000000000000000000"]);
+    assert(solvePrecise("x", "x^2 - 5x + 6 = 0", 4) == ["x: 3.0000", "x: 2.0000"]);
+    assert(solvePrecise("x", "x^3 - 3x^2 + 3x - 1 = 0", 4) == ["x: 1.0000"]);
+
+    // Casus irreducibilis: 2cos(2pi/9), 2cos(4pi/9), 2cos(8pi/9).
+    assert(solvePrecise("x", "x^3 - 3x + 1 = 0", 20)
+           == ["x: 1.53208888623795607040", "x: 0.34729635533386069770",
+               "x: -1.87938524157181676811"]);
+
+    // Real roots come back as dpd values that pack into declets.
+    auto dpdRoots = solveRealRoots("x", "x^2 - 2 = 0", 45);
+    assert(dpdRoots.length == 2);
+    assert(dpdRoots[0].digits.length == 46);
+    assert(dpdRoots[0].pack().length == 16);
+    assert(dpd.unpackDigits(dpdRoots[0].pack())[$ - 46 .. $] == dpdRoots[0].digits);
+
+    assert(solvePrecise("x", "x^2 + 1 = 0", 3)
+           == ["x: 0.000 + 1.000i", "x: 0.000 - 1.000i"]);
+    assert(solveRealRoots("x", "x^2 + 1 = 0", 3).length == 0);
 }
