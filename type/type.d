@@ -450,7 +450,9 @@ bid bidRound(bid v, int scale) {
 }
 
 // Square root to `scale` decimal places, via integer sqrt of the value
-// shifted left by 2*scale digits.
+// shifted left by 2*scale digits. Truncates rather than rounds, so the
+// result never overstates the root; pair with bidRound if the
+// nearest-value answer is what you want.
 bid bidSqrt(bid v, int scale) {
     enforce(!v.negative, "bidSqrt of a negative value");
     int shift = v.exponent + 2 * scale;
@@ -849,6 +851,11 @@ struct bid {
         return divide(bid(rhs), scale);
     }
 
+    // Arbitrary-precision roots and rounding, callable directly on a value.
+    bid sqrt(int scale) const { return bidSqrt(this, scale); }
+    bid cbrt(int scale) const { return bidCbrt(this, scale); }
+    bid round(int scale) const { return bidRound(this, scale); }
+
     string toString() const {
         string sign = negative ? "-" : "";
         string s = coefficient.toDecimalString();
@@ -949,6 +956,11 @@ struct dpd {
             if (!is(Unqual!T == dpd) && __traits(compiles, dpd(rhs))) {
         return divide(dpd(rhs), scale);
     }
+
+    // Arbitrary-precision roots and rounding, without hopping through bid.
+    dpd sqrt(int scale) const { return dpd.fromBid(bidSqrt(toBid(), scale)); }
+    dpd cbrt(int scale) const { return dpd.fromBid(bidCbrt(toBid(), scale)); }
+    dpd round(int scale) const { return dpd.fromBid(bidRound(toBid(), scale)); }
 
     // Packs digits into 10-bit declets, left-padding with zero digits
     // so the digit count is a multiple of 3.
@@ -1098,4 +1110,16 @@ unittest {
     assert(solvePrecise("x", "x^2 + 1 = 0", 3)
            == ["x: 0.000 + 1.000i", "x: 0.000 - 1.000i"]);
     assert(solveRealRoots("x", "x^2 + 1 = 0", 3).length == 0);
+
+    // sqrt/cbrt/round are callable straight off a value, on both types.
+    dpd dTwo = 2;
+    bid bTwo = 2;
+    assert(dTwo.sqrt(40).toString() == bTwo.sqrt(40).toString());
+    assert(dTwo.cbrt(40).toString() == bTwo.cbrt(40).toString());
+    assert(dTwo.sqrt(40).round(10).toString() == "1.4142135624");
+
+    // The roots truncate; rounding is opt-in via an extra digit and round().
+    assert(dTwo.sqrt(40).toString().length == 42);       // "1." + 40 digits
+    assert(dTwo.sqrt(40).toString()[$ - 1] == '6');      // truncated
+    assert(dTwo.sqrt(45).round(40).toString()[$ - 1] == '7'); // rounded
 }
