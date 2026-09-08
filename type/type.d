@@ -239,10 +239,158 @@ struct posit {
 }
 
 // 6. solve
-string[] solve(string varTypes, string equation) {
-    string[] results;
-    results ~= "x: 0";
-    return results;
+
+// Parses one side of an equation into coefficients indexed by power,
+// so "2x^2 - 3x + 1" becomes [1, -3, 2, 0]. Accepts an implicit 1
+// coefficient ("x^2"), an optional '*' ("2*x"), and free whitespace.
+private double[4] parseSide(string expr, char varName) {
+    import std.ascii : isAsciiDigit = isDigit;
+
+    double[4] coeffs = [0.0, 0.0, 0.0, 0.0];
+    size_t i = 0;
+
+    void skipSpaces() {
+        while (i < expr.length && (expr[i] == ' ' || expr[i] == '\t')) i++;
+    }
+
+    skipSpaces();
+    enforce(i < expr.length, "Empty expression in equation");
+
+    while (i < expr.length) {
+        skipSpaces();
+        if (i >= expr.length) break;
+
+        double sign = 1.0;
+        if (expr[i] == '+') { i++; }
+        else if (expr[i] == '-') { sign = -1.0; i++; }
+        skipSpaces();
+
+        // Coefficient, if written out.
+        double coeff = 1.0;
+        bool hasCoeff = false;
+        size_t start = i;
+        while (i < expr.length && (isAsciiDigit(expr[i]) || expr[i] == '.')) i++;
+        if (i > start) {
+            coeff = to!double(expr[start .. i]);
+            hasCoeff = true;
+        }
+
+        skipSpaces();
+        if (i < expr.length && expr[i] == '*') { i++; skipSpaces(); }
+
+        // Variable and its power, if present.
+        int power = 0;
+        if (i < expr.length && expr[i] == varName) {
+            i++;
+            power = 1;
+            skipSpaces();
+            if (i < expr.length && expr[i] == '^') {
+                i++;
+                skipSpaces();
+                start = i;
+                while (i < expr.length && isAsciiDigit(expr[i])) i++;
+                enforce(i > start, "Missing exponent after '^'");
+                power = to!int(expr[start .. i]);
+            }
+        } else {
+            enforce(hasCoeff, "Unexpected character in equation: '" ~ expr[i] ~ "'");
+        }
+
+        enforce(power <= 3, "Only equations up to degree 3 are supported");
+        coeffs[power] += sign * coeff;
+        skipSpaces();
+    }
+
+    return coeffs;
+}
+
+// Trims float noise so roots read as "2" rather than "1.9999999999999998".
+private string formatRoot(double v) {
+    double rounded = std.math.round(v);
+    if (abs(v - rounded) < 1e-9) v = rounded;
+    if (v == 0) v = 0.0; // collapse -0
+    return format("%.10g", v);
+}
+
+private string formatComplex(double re, double im) {
+    if (abs(im) < 1e-9) return formatRoot(re);
+    string sign = im < 0 ? " - " : " + ";
+    return formatRoot(re) ~ sign ~ formatRoot(abs(im)) ~ "i";
+}
+
+// Solves a polynomial equation of degree 1-3 in one variable.
+// `varName` is the variable to solve for ("x" if empty); `equation` may
+// carry terms on both sides ("x^2 = 2x + 3") or none on the right.
+// Returns one "<var>: <root>" entry per root, complex roots included.
+string[] solve(string varName, string equation) {
+    char v = varName.length ? varName[0] : 'x';
+
+    auto eqPos = equation.indexOf('=');
+    double[4] lhs = parseSide(eqPos == -1 ? equation : equation[0 .. eqPos], v);
+    double[4] coeffs = lhs;
+    if (eqPos != -1) {
+        double[4] rhs = parseSide(equation[eqPos + 1 .. $], v);
+        foreach (idx; 0 .. 4) coeffs[idx] -= rhs[idx];
+    }
+
+    enum eps = 1e-12;
+    string label(string root) { return v ~ ": " ~ root; }
+
+    double a3 = coeffs[3], a2 = coeffs[2], a1 = coeffs[1], a0 = coeffs[0];
+
+    if (abs(a3) < eps && abs(a2) < eps && abs(a1) < eps) {
+        return abs(a0) < eps ? ["infinitely many solutions"] : ["no solution"];
+    }
+
+    if (abs(a3) < eps && abs(a2) < eps) {
+        return [label(formatRoot(-a0 / a1))];
+    }
+
+    if (abs(a3) < eps) {
+        double disc = a1 * a1 - 4 * a2 * a0;
+        if (abs(disc) < eps) return [label(formatRoot(-a1 / (2 * a2)))];
+        if (disc > 0) {
+            double sq = sqrt(disc);
+            return [label(formatRoot((-a1 + sq) / (2 * a2))),
+                    label(formatRoot((-a1 - sq) / (2 * a2)))];
+        }
+        double re = -a1 / (2 * a2);
+        double im = sqrt(-disc) / (2 * a2);
+        return [label(formatComplex(re, im)), label(formatComplex(re, -im))];
+    }
+
+    // Cubic: normalise, then depress to t^3 + p*t + q via x = t - b/3.
+    double b = a2 / a3, c = a1 / a3, d = a0 / a3;
+    double p = c - b * b / 3.0;
+    double q = 2.0 * b * b * b / 27.0 - b * c / 3.0 + d;
+    double shift = b / 3.0;
+    double delta = q * q / 4.0 + p * p * p / 27.0;
+
+    if (abs(delta) < 1e-12) {
+        if (abs(p) < eps) return [label(formatRoot(-shift))]; // triple root
+        double t1 = 3.0 * q / p;
+        double t2 = -3.0 * q / (2.0 * p);
+        return [label(formatRoot(t1 - shift)), label(formatRoot(t2 - shift))];
+    }
+
+    if (delta > 0) {
+        // One real root; the other two are a complex conjugate pair.
+        double sq = sqrt(delta);
+        double u = cbrt(-q / 2.0 + sq);
+        double w = cbrt(-q / 2.0 - sq);
+        double re = -(u + w) / 2.0 - shift;
+        double im = (u - w) * sqrt(3.0) / 2.0;
+        return [label(formatRoot(u + w - shift)),
+                label(formatComplex(re, im)), label(formatComplex(re, -im))];
+    }
+
+    // delta < 0: three distinct real roots (casus irreducibilis).
+    double m = 2.0 * sqrt(-p / 3.0);
+    double theta = acos(3.0 * q / (2.0 * p) * sqrt(-3.0 / p)) / 3.0;
+    string[] roots;
+    foreach (k; 0 .. 3)
+        roots ~= label(formatRoot(m * cos(theta - 2.0 * PI * k / 3.0) - shift));
+    return roots;
 }
 
 unittest {
@@ -636,4 +784,31 @@ unittest {
 
     dpd literalD = 2.25;
     assert(literalD.toString() == "2.25");
+
+    // solve: degree 1
+    assert(solve("x", "x + 5 = 12") == ["x: 7"]);
+    assert(solve("x", "2*x = 10") == ["x: 5"]);
+    assert(solve("x", "3x - 9 = 0") == ["x: 3"]);
+
+    // solve: degree 2, including terms on both sides and a repeated root
+    assert(solve("x", "x^2 - 5x + 6 = 0") == ["x: 3", "x: 2"]);
+    assert(solve("x", "x^2 = 2x + 3") == ["x: 3", "x: -1"]);
+    assert(solve("x", "x^2 - 2x + 1 = 0") == ["x: 1"]);
+    assert(solve("x", "x^2 + 1 = 0") == ["x: 0 + 1i", "x: 0 - 1i"]);
+
+    // solve: degree 3 -- distinct real, triple, and one real + conjugate pair
+    assert(solve("x", "x^3 - 6x^2 + 11x - 6 = 0") == ["x: 3", "x: 2", "x: 1"]);
+    assert(solve("x", "x^3 - 3x^2 + 3x - 1 = 0") == ["x: 1"]);
+    assert(solve("x", "x^3 = 8")
+           == ["x: 2", "x: -1 + 1.732050808i", "x: -1 - 1.732050808i"]);
+
+    // solve: a variable other than x, and the degenerate cases
+    assert(solve("y", "2y - 8 = 0") == ["y: 4"]);
+    assert(solve("x", "x - x = 0") == ["infinitely many solutions"]);
+    assert(solve("x", "x - x = 5") == ["no solution"]);
+
+    // solve: degree above 3 is rejected rather than silently mis-solved
+    bool threw = false;
+    try { solve("x", "x^4 = 1"); } catch (Exception) { threw = true; }
+    assert(threw);
 }
