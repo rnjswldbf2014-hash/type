@@ -245,10 +245,10 @@ struct posit {
 // coefficient ("x^2"), an optional '*' ("2*x"), and free whitespace.
 // Coefficients are kept as exact bid values, never routed through a
 // double, so the arbitrary-precision solver starts from exact input.
-private bid[4] parseSide(string expr, char varName) {
+private bid[5] parseSide(string expr, char varName) {
     import std.ascii : isAsciiDigit = isDigit;
 
-    bid[4] coeffs = [bid(0L), bid(0L), bid(0L), bid(0L)];
+    bid[5] coeffs = [bid(0L), bid(0L), bid(0L), bid(0L), bid(0L)];
     size_t i = 0;
 
     void skipSpaces() {
@@ -298,7 +298,7 @@ private bid[4] parseSide(string expr, char varName) {
             enforce(hasCoeff, "Unexpected character in equation: '" ~ expr[i] ~ "'");
         }
 
-        enforce(power <= 3, "Only equations up to degree 3 are supported");
+        enforce(power <= 4, "Only equations up to degree 4 are supported");
         if (negate) coeff.negative = !coeff.negative && coeff.coefficient != 0;
         coeffs[power] = coeffs[power] + coeff;
         skipSpaces();
@@ -323,17 +323,42 @@ private string formatComplex(double re, double im) {
 
 // Reduces an equation to exact coefficients indexed by power, moving any
 // right-hand terms across the '='. Shared by both solvers.
-private bid[4] equationCoeffs(string equation, char v) {
+private bid[5] equationCoeffs(string equation, char v) {
     auto eqPos = equation.indexOf('=');
-    bid[4] coeffs = parseSide(eqPos == -1 ? equation : equation[0 .. eqPos], v);
+    bid[5] coeffs = parseSide(eqPos == -1 ? equation : equation[0 .. eqPos], v);
     if (eqPos != -1) {
-        bid[4] rhs = parseSide(equation[eqPos + 1 .. $], v);
-        foreach (idx; 0 .. 4) coeffs[idx] = coeffs[idx] - rhs[idx];
+        bid[5] rhs = parseSide(equation[eqPos + 1 .. $], v);
+        foreach (idx; 0 .. 5) coeffs[idx] = coeffs[idx] - rhs[idx];
     }
     return coeffs;
 }
 
-// Solves a polynomial equation of degree 1-3 in one variable.
+// Real roots of a cubic, as doubles. Used for the quartic's resolvent,
+// where only a real root is needed and its sign matters.
+private double[] cubicRealRoots(double a3, double a2, double a1, double a0) {
+    double b = a2 / a3, c = a1 / a3, d = a0 / a3;
+    double p = c - b * b / 3.0;
+    double q = 2.0 * b * b * b / 27.0 - b * c / 3.0 + d;
+    double shift = b / 3.0;
+    double delta = q * q / 4.0 + p * p * p / 27.0;
+
+    if (abs(delta) < 1e-14) {
+        if (abs(p) < 1e-14) return [-shift];
+        return [3.0 * q / p - shift, -3.0 * q / (2.0 * p) - shift];
+    }
+    if (delta > 0) {
+        double sq = sqrt(delta);
+        return [cbrt(-q / 2.0 + sq) + cbrt(-q / 2.0 - sq) - shift];
+    }
+    double m = 2.0 * sqrt(-p / 3.0);
+    double theta = acos(3.0 * q / (2.0 * p) * sqrt(-3.0 / p)) / 3.0;
+    double[] roots;
+    foreach (k; 0 .. 3)
+        roots ~= m * cos(theta - 2.0 * PI * k / 3.0) - shift;
+    return roots;
+}
+
+// Solves a polynomial equation of degree 1-4 in one variable.
 // `varName` is the variable to solve for ("x" if empty); `equation` may
 // carry terms on both sides ("x^2 = 2x + 3") or none on the right.
 // Returns one "<var>: <root>" entry per root, complex roots included.
@@ -341,14 +366,98 @@ private bid[4] equationCoeffs(string equation, char v) {
 string[] solve(string varName, string equation) {
     char v = varName.length ? varName[0] : 'x';
 
-    bid[4] exact = equationCoeffs(equation, v);
-    double[4] coeffs;
-    foreach (idx; 0 .. 4) coeffs[idx] = getDouble(exact[idx]);
+    bid[5] exact = equationCoeffs(equation, v);
+    double[5] coeffs;
+    foreach (idx; 0 .. 5) coeffs[idx] = getDouble(exact[idx]);
 
     enum eps = 1e-12;
     string label(string root) { return v ~ ": " ~ root; }
 
-    double a3 = coeffs[3], a2 = coeffs[2], a1 = coeffs[1], a0 = coeffs[0];
+    double a4 = coeffs[4], a3 = coeffs[3], a2 = coeffs[2],
+           a1 = coeffs[1], a0 = coeffs[0];
+
+    // Quartic, by Ferrari: depress to y^4 + p*y^2 + q*y + r, then split
+    // into two quadratics using a positive root of the resolvent cubic.
+    if (abs(a4) >= eps) {
+        double b = a3 / a4, c = a2 / a4, d = a1 / a4, e = a0 / a4;
+        double shift = b / 4.0;
+        double p = c - 3.0 * b * b / 8.0;
+        double q = d - b * c / 2.0 + b * b * b / 8.0;
+        double r = e - b * d / 4.0 + b * b * c / 16.0 - 3.0 * b * b * b * b / 256.0;
+
+        double[2][] found; // [real part, imaginary part]
+
+        // Roots of one quadratic y^2 + B*y + C, shifted back to x.
+        void addQuadratic(double B, double C) {
+            double disc = B * B - 4.0 * C;
+            if (disc >= 0) {
+                double sq = sqrt(disc);
+                found ~= [(-B + sq) / 2.0 - shift, 0.0];
+                found ~= [(-B - sq) / 2.0 - shift, 0.0];
+            } else {
+                double re = -B / 2.0 - shift;
+                double im = sqrt(-disc) / 2.0;
+                found ~= [re, im];
+                found ~= [re, -im];
+            }
+        }
+
+        if (abs(q) < eps) {
+            // Biquadratic: solve for y^2, then take square roots.
+            double disc = p * p - 4.0 * r;
+            if (disc >= 0) {
+                double sq = sqrt(disc);
+                foreach (z; [(-p + sq) / 2.0, (-p - sq) / 2.0]) {
+                    if (z >= 0) {
+                        double y = sqrt(z);
+                        found ~= [y - shift, 0.0];
+                        found ~= [-y - shift, 0.0];
+                    } else {
+                        double y = sqrt(-z);
+                        found ~= [-shift, y];
+                        found ~= [-shift, -y];
+                    }
+                }
+            } else {
+                // z is a complex pair; its square roots give all four roots.
+                double m = sqrt(r); // |z|, since r = |z|^2 here
+                double g = sqrt((m - p / 2.0) / 2.0);
+                double h = sqrt((m + p / 2.0) / 2.0);
+                found ~= [g - shift, h];
+                found ~= [g - shift, -h];
+                found ~= [-g - shift, h];
+                found ~= [-g - shift, -h];
+            }
+        } else {
+            double[] zs = cubicRealRoots(1.0, 2.0 * p, p * p - 4.0 * r, -q * q);
+            double z = double.nan;
+            foreach (cand; zs)
+                if (cand > eps && (isNaN(z) || cand > z)) z = cand;
+            enforce(!isNaN(z), "Could not solve the resolvent cubic");
+            double s = sqrt(z);
+            addQuadratic(s, (p + z - q / s) / 2.0);
+            addQuadratic(-s, (p + z + q / s) / 2.0);
+        }
+
+        // Real roots first, each group descending, so the ordering matches
+        // the lower-degree cases instead of interleaving the two quadratics.
+        found.sort!((x, y) {
+            bool xr = abs(x[1]) < 1e-9, yr = abs(y[1]) < 1e-9;
+            if (xr != yr) return xr;
+            if (x[0] != y[0]) return x[0] > y[0];
+            return x[1] > y[1];
+        });
+
+        // Repeated roots are reported once, matching the cubic's behaviour.
+        string[] unique;
+        foreach (root; found) {
+            string s = abs(root[1]) < 1e-9
+                     ? label(formatRoot(root[0]))
+                     : label(formatComplex(root[0], root[1]));
+            if (!unique.canFind(s)) unique ~= s;
+        }
+        return unique;
+    }
 
     if (abs(a3) < eps && abs(a2) < eps && abs(a1) < eps) {
         return abs(a0) < eps ? ["infinitely many solutions"] : ["no solution"];
@@ -506,6 +615,46 @@ bid refineRoot(bid[] coeffs, bid guess, int multiplicity, int scale) {
     return x;
 }
 
+// Complex arithmetic on [real, imaginary] bid pairs, enough to run Newton
+// on a complex root at arbitrary precision.
+private bid[2] cxMul(bid[2] a, bid[2] b, int scale) {
+    return [bidRound(a[0] * b[0] - a[1] * b[1], scale),
+            bidRound(a[0] * b[1] + a[1] * b[0], scale)];
+}
+
+private bid[2] cxDiv(bid[2] a, bid[2] b, int scale) {
+    bid den = b[0] * b[0] + b[1] * b[1];
+    return [(a[0] * b[0] + a[1] * b[1]).divide(den, scale),
+            (a[1] * b[0] - a[0] * b[1]).divide(den, scale)];
+}
+
+private bid[2] polyEvalCx(bid[] coeffs, bid[2] x, int scale) {
+    bid[2] acc = [bid(0L), bid(0L)];
+    foreach_reverse (c; coeffs) {
+        acc = cxMul(acc, x, scale);
+        acc[0] = bidRound(acc[0] + c, scale);
+    }
+    return acc;
+}
+
+// Newton refinement of a complex root, in exact arithmetic.
+bid[2] refineComplexRoot(bid[] coeffs, bid re, bid im, int scale) {
+    bid[] deriv = polyDeriv(coeffs);
+    bid[2] z = [bidRound(re, scale), bidRound(im, scale)];
+    foreach (_; 0 .. 500) {
+        bid[2] fz = polyEvalCx(coeffs, z, scale);
+        bid[2] dfz = polyEvalCx(deriv, z, scale);
+        if (dfz[0].coefficient == 0 && dfz[1].coefficient == 0) break;
+        bid[2] step = cxDiv(fz, dfz, scale);
+        bid[2] next = [bidRound(z[0] - step[0], scale),
+                       bidRound(z[1] - step[1], scale)];
+        if ((next[0] - z[0]).coefficient == 0
+            && (next[1] - z[1]).coefficient == 0) return next;
+        z = next;
+    }
+    return z;
+}
+
 private string labelRoot(char v, bid value) {
     return v ~ ": " ~ value.toString();
 }
@@ -516,23 +665,68 @@ private string labelComplex(char v, bid re, bid im) {
     return v ~ ": " ~ re.toString() ~ (negIm ? " - " : " + ") ~ mag.toString() ~ "i";
 }
 
-// Solves a degree 1-3 equation to `scale` decimal places using exact
+// Solves a degree 1-4 equation to `scale` decimal places using exact
 // decimal arithmetic throughout. Same equation syntax as solve().
 //
 // Degree 1, degree 2, and the repeated-root cubics are closed-form and
-// exact. The remaining cubics are seeded from the double solver and then
-// Newton-refined in exact arithmetic, which is what carries them past
-// double's ~17 digits.
+// exact. The remaining cubics and every quartic are seeded from the
+// double solver and then Newton-refined in exact arithmetic, which is
+// what carries them past double's ~17 digits.
 string[] solvePrecise(string varName, string equation, int scale) {
     enforce(scale >= 0, "scale must not be negative");
     char v = varName.length ? varName[0] : 'x';
     int work = scale + 20; // guard digits, trimmed on the way out
 
-    bid[4] c = equationCoeffs(equation, v);
-    bid a3 = c[3], a2 = c[2], a1 = c[1], a0 = c[0];
+    bid[5] c = equationCoeffs(equation, v);
+    bid a4 = c[4], a3 = c[3], a2 = c[2], a1 = c[1], a0 = c[0];
 
     bool isZero(bid b) { return b.coefficient == 0; }
     string outRoot(bid r) { return labelRoot(v, bidRound(r, scale)); }
+
+    // Quartic: take each root the double solver found and refine it in
+    // exact arithmetic. Real roots refine against the polynomial itself;
+    // complex pairs are recovered by deflating out the real roots, or --
+    // when all four are complex -- from the exactly-solved resolvent.
+    if (!isZero(a4)) {
+        bid[] poly = [a0, a1, a2, a3, a4];
+        string[] approx = solve(varName, equation);
+
+        // Multiplicity of each approximate root, so Newton stays quadratic.
+        string[] result;
+        foreach (entry; approx) {
+            auto colon = entry.indexOf(": ");
+            if (colon == -1) return approx; // "no solution" and friends
+            string val = entry[colon + 2 .. $];
+
+            if (val.indexOf('i') == -1) {
+                double seed = to!double(val);
+                int mult = 1;
+                bid[] d1 = polyDeriv(poly);
+                if (polyEval(d1, bid(seed), 12).round(6) == bid(0L)) {
+                    mult = 2;
+                    bid[] d2 = polyDeriv(d1);
+                    if (polyEval(d2, bid(seed), 12).round(6) == bid(0L)) mult = 3;
+                }
+                result ~= outRoot(refineRoot(poly, bid(seed), mult, work));
+            } else {
+                // Refine the complex pair via its exact quadratic factor:
+                // y^2 - 2*re*y + (re^2 + im^2), whose coefficients come from
+                // Newton on the real and imaginary parts jointly. Seeding
+                // from the double values and re-deriving the factor keeps
+                // this exact to `work` digits.
+                auto plus = val.indexOf(" + ");
+                auto minus = val.indexOf(" - ");
+                auto sep = plus != -1 ? plus : minus;
+                double sre = to!double(val[0 .. sep]);
+                double sim = to!double(val[sep + 3 .. $ - 1]);
+                if (minus != -1 && plus == -1) sim = -sim;
+                auto refined = refineComplexRoot(poly, bid(sre), bid(sim), work);
+                result ~= labelComplex(v, bidRound(refined[0], scale),
+                                          bidRound(refined[1], scale));
+            }
+        }
+        return result;
+    }
 
     if (isZero(a3) && isZero(a2) && isZero(a1))
         return isZero(a0) ? ["infinitely many solutions"] : ["no solution"];
@@ -1069,9 +1263,23 @@ unittest {
     assert(solve("x", "x - x = 0") == ["infinitely many solutions"]);
     assert(solve("x", "x - x = 5") == ["no solution"]);
 
-    // solve: degree above 3 is rejected rather than silently mis-solved
+    // solve: degree 4 (Ferrari)
+    assert(solve("x", "x^4 - 1 = 0")
+           == ["x: 1", "x: -1", "x: 0 + 1i", "x: 0 - 1i"]);
+    assert(solve("x", "x^4 - 5x^2 + 4 = 0")
+           == ["x: 2", "x: 1", "x: -1", "x: -2"]);
+    assert(solve("x", "x^4 - 2x^3 - 13x^2 + 14x + 24 = 0")
+           == ["x: 4", "x: 2", "x: -1", "x: -3"]);
+    assert(solve("x", "x^4 + x = 0")
+           == ["x: 0", "x: -1", "x: 0.5 + 0.8660254038i", "x: 0.5 - 0.8660254038i"]);
+    assert(solve("x", "x^4 - 10x^3 + 35x^2 - 50x + 24 = 0")
+           == ["x: 4", "x: 3", "x: 2", "x: 1"]);
+    assert(solve("x", "x^4 = 0") == ["x: 0"]);            // quadruple root
+    assert(solve("x", "x^4 + 1 = 0").length == 4);        // all complex
+
+    // solve: degree above 4 is rejected rather than silently mis-solved
     bool threw = false;
-    try { solve("x", "x^4 = 1"); } catch (Exception) { threw = true; }
+    try { solve("x", "x^5 = 1"); } catch (Exception) { threw = true; }
     assert(threw);
 
     // Arbitrary-precision roots, checked against the known expansions.
@@ -1110,6 +1318,28 @@ unittest {
     assert(solvePrecise("x", "x^2 + 1 = 0", 3)
            == ["x: 0.000 + 1.000i", "x: 0.000 - 1.000i"]);
     assert(solveRealRoots("x", "x^2 + 1 = 0", 3).length == 0);
+
+    // Quartics at arbitrary precision. 2^(1/4) cross-checks against
+    // sqrt(sqrt(2)) computed by the independent integer-root path.
+    bid fourthRoot2 = bidSqrt(bidSqrt(bid(2L), 60), 50);
+    assert(solvePrecise("x", "x^4 - 2 = 0", 45)[0]
+           == "x: " ~ fourthRoot2.round(45).toString());
+
+    // x^4 + 1 = 0 has all four roots at +-sqrt(2)/2 +- sqrt(2)/2 i.
+    bid halfRoot2 = bidRound(bidSqrt(bid(2L), 60) * bid("0.5"), 40);
+    assert(solvePrecise("x", "x^4 + 1 = 0", 40)[0]
+           == "x: " ~ halfRoot2.toString() ~ " + " ~ halfRoot2.toString() ~ "i");
+
+    // Integer roots stay exact at any scale.
+    assert(solvePrecise("x", "x^4 - 10x^3 + 35x^2 - 50x + 24 = 0", 4)
+           == ["x: 4.0000", "x: 3.0000", "x: 2.0000", "x: 1.0000"]);
+
+    // Irrational quartic roots satisfy the polynomial to full precision.
+    foreach (root; solveRealRoots("x", "x^4 - x^3 - x^2 - x - 1 = 0", 40)) {
+        bid t = root.toBid();
+        bid ft = t * t * t * t - t * t * t - t * t - t - bid(1L);
+        assert(ft.round(33) == bid(0L));
+    }
 
     // sqrt/cbrt/round are callable straight off a value, on both types.
     dpd dTwo = 2;
