@@ -14,7 +14,7 @@ import std.format;
 double getDouble(T)(T v) {
     alias UT = Unqual!T;
     static if (isNumeric!UT) return to!double(v);
-    else static if (is(UT == fra)) return to!double(v.num) / to!double(v.den);
+    else static if (is(UT == fra)) return bigRatioToDouble(v.num, v.den);
     else static if (is(UT == dfloat)) return v.val;
     else static if (is(UT == dec)) return v.val;
     else static if (is(UT == posit)) return v.val;
@@ -67,29 +67,65 @@ BigInt bigGcd(BigInt a, BigInt b) {
     return a;
 }
 
+BigInt bigLcm(BigInt a, BigInt b) {
+    if (a == 0 || b == 0) return BigInt(0);
+    BigInt r = (a / bigGcd(a, b)) * b;
+    return r < 0 ? -r : r;
+}
+
+// Approximates a big rational as a double. Going through toDecimalString
+// alone would overflow to infinity on values a double can still represent
+// as a ratio, so the magnitudes are cancelled before converting.
+private double bigRatioToDouble(BigInt n, BigInt d) {
+    if (d == 0) return double.nan;
+    if (n == 0) return 0.0;
+    bool neg = (n < 0) != (d < 0);
+    if (n < 0) n = -n;
+    if (d < 0) d = -d;
+
+    int digitsN = cast(int)n.toDecimalString().length;
+    int digitsD = cast(int)d.toDecimalString().length;
+    int shift = 25 - (digitsN - digitsD); // aim for ~25 digits of quotient
+    if (shift > 0) n *= pow10(shift);
+    else if (shift < 0) d *= pow10(-shift);
+
+    double q = to!double((n / d).toDecimalString());
+    double val = q * (10.0 ^^ cast(double)(-shift));
+    return neg ? -val : val;
+}
+
 // 2. fra (Fraction)
+//
+// num/den are BigInt, so a fraction can hold any bid or dpd value exactly,
+// however many digits it has, and intermediate sums never overflow.
 struct fra {
-    long num;
-    long den;
-    
-    this(long numerator, long denominator) {
+    BigInt num;
+    BigInt den;
+
+    this(BigInt numerator, BigInt denominator) {
         enforce(denominator != 0, "Denominator cannot be zero");
         num = numerator;
         den = denominator;
     }
 
+    this(long numerator, long denominator) {
+        enforce(denominator != 0, "Denominator cannot be zero");
+        num = BigInt(numerator);
+        den = BigInt(denominator);
+    }
+
     // Enables direct declaration from an integer literal: fra x = 5;
     this(long v) {
-        num = v;
-        den = 1;
+        num = BigInt(v);
+        den = BigInt(1);
     }
 
     // Enables direct declaration from a string: fra x = "3/4"; or fra x = "0.75";
     this(string s) {
         auto slashPos = s.indexOf('/');
         if (slashPos != -1) {
-            num = to!long(s[0 .. slashPos]);
-            den = to!long(s[slashPos + 1 .. $]);
+            num = BigInt(s[0 .. slashPos].strip());
+            den = BigInt(s[slashPos + 1 .. $].strip());
             enforce(den != 0, "Denominator cannot be zero");
         } else {
             fra exact = exactFrom(bid(s));
@@ -100,7 +136,7 @@ struct fra {
 
     // Exact (lossless) conversion from a bid value: coefficient * 10^exponent
     // is reduced to num/den, so e.g. 0.25 becomes exactly 1/4, not an
-    // approximation. Throws if the reduced value overflows `long`.
+    // approximation, at any number of digits.
     static fra exactFrom(bid b) {
         BigInt n, d;
         if (b.exponent >= 0) {
@@ -112,40 +148,57 @@ struct fra {
         }
         BigInt g = bigGcd(n, d);
         if (g != 0) { n /= g; d /= g; }
-        enforce(n <= long.max && d <= long.max,
-                "Value too large to represent exactly as fra (long overflow)");
-        long ln = n.toLong();
-        long ld = d.toLong();
-        return fra(b.negative ? -ln : ln, ld);
+        return fra(b.negative ? -n : n, d);
+    }
+
+    // Exact conversion back to a decimal, when the fraction has one: a
+    // fraction terminates in base 10 only if its reduced denominator is
+    // 2^a * 5^b. Otherwise use toBid(scale) for a rounded decimal.
+    bid toBid(int scale) const {
+        return bidSigned(num, 0).divide(bidSigned(den, 0), scale);
     }
 
     string toString() const {
-        return to!string(num) ~ "/" ~ to!string(den);
+        return num.toDecimalString() ~ "/" ~ den.toDecimalString();
     }
 
     fra opBinary(string op, R)(R rhs) const {
         fra r = getFra(rhs);
         fra l = this;
         static if (op == "+") {
-            long d = lcm(l.den, r.den);
-            return simfra(fra(l.num * (d / l.den) + r.num * (d / r.den), d));
+            return simfra(fra(l.num * r.den + r.num * l.den, l.den * r.den));
         } else static if (op == "-") {
-            long d = lcm(l.den, r.den);
-            return simfra(fra(l.num * (d / l.den) - r.num * (d / r.den), d));
+            return simfra(fra(l.num * r.den - r.num * l.den, l.den * r.den));
         } else static if (op == "*") {
             return simfra(fra(l.num * r.num, l.den * r.den));
         } else static if (op == "/") {
+            enforce(r.num != 0, "Division by zero");
             return simfra(fra(l.num * r.den, l.den * r.num));
         } else {
             static assert(0, "Operator not supported");
         }
     }
+
+    fra opUnary(string op)() const if (op == "-") {
+        return fra(-num, den);
+    }
+
+    int opCmp(fra rhs) const {
+        // Denominators are kept positive by simfra, so cross-multiplying
+        // compares without flipping the inequality.
+        BigInt lhs = num * rhs.den, other = rhs.num * den;
+        if (lhs < other) return -1;
+        if (lhs > other) return 1;
+        return 0;
+    }
+
+    bool opEquals(fra rhs) const { return opCmp(rhs) == 0; }
 }
 
 fra simfra(fra f) {
-    long d = gcd(f.num, f.den);
-    long newNum = f.num / d;
-    long newDen = f.den / d;
+    BigInt d = bigGcd(f.num, f.den);
+    BigInt newNum = f.num, newDen = f.den;
+    if (d != 0) { newNum /= d; newDen /= d; }
     if (newDen < 0) {
         newNum = -newNum;
         newDen = -newDen;
@@ -154,7 +207,7 @@ fra simfra(fra f) {
 }
 
 void comden(ref fra a, ref fra b) {
-    long d = lcm(a.den, b.den);
+    BigInt d = bigLcm(a.den, b.den);
     a.num *= (d / a.den);
     b.num *= (d / b.den);
     a.den = d;
@@ -1307,6 +1360,29 @@ unittest {
 
     fra five = 5;
     assert(five.num == 5 && five.den == 1);
+
+    // fra is BigInt-backed, so a long decimal converts exactly and round
+    // trips, where the old long-based fields overflowed and threw.
+    enum long41 = "0.04714038928745574865871078547801351068934";
+    fra wide = getFra(bid(long41));
+    assert(wide.toBid(41).toString() == long41);
+    assert((wide * fra(2L) / fra(2L)) == wide);
+
+    // Sums of very different magnitudes stay exact.
+    fra third = fra(1, 3);
+    fra tiny = getFra(bid("0.00000000000000000000000000000000000000001"));
+    assert(((third + tiny) - tiny) == third);
+
+    // Unary minus, comparison and division.
+    fra threeQuarter = "3/4";
+    assert((-threeQuarter).toString() == "-3/4");
+    assert(threeQuarter > fra("1/2"));
+    assert(threeQuarter == fra("6/8"));           // compares by value
+    assert((threeQuarter / fra("1/2")).toString() == "3/2");
+
+    // Magnitudes beyond double saturate instead of producing nonsense.
+    assert(getDouble(fra(BigInt(1), pow10(400))) == 0.0);
+    assert(getDouble(fra(pow10(400), BigInt(3))) == double.infinity);
 
     // Plain decimal literals (no quotes) work via shortest round-trip.
     bid literalA = 1.5;
