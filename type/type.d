@@ -687,6 +687,155 @@ bid bidLog(bid base, bid v, int scale) {
 bid bidLog10(bid v, int scale) { return bidLog(bid(10L), v, scale); }
 bid bidLog2(bid v, int scale) { return bidLog(bid(2L), v, scale); }
 
+// 11. Constants and trigonometry, all to a requested number of decimals.
+
+// atan(1/n) as an integer scaled by 10^scale, summed in BigInt so the
+// whole series runs without constructing a bid per term.
+private BigInt atanInverseScaled(long n, int scale) {
+    BigInt nsq = BigInt(n) * n;
+    BigInt term = pow10(scale) / n;
+    BigInt sum = term;
+    for (long k = 1; term != 0; k++) {
+        term /= nsq;
+        BigInt piece = term / (2 * k + 1);
+        if (piece == 0 && term == 0) break;
+        if (k % 2 == 1) sum -= piece;
+        else sum += piece;
+    }
+    return sum;
+}
+
+// pi by Machin's formula: pi/4 = 4*atan(1/5) - atan(1/239).
+bid bidPi(int scale) {
+    enforce(scale >= 0, "scale must not be negative");
+    int work = scale + 20;
+    BigInt quarter = 4 * atanInverseScaled(5, work) - atanInverseScaled(239, work);
+    return bidRound(bid(false, 4 * quarter, -work), scale);
+}
+
+// e as the sum of 1/k!, likewise accumulated in BigInt.
+bid bidE(int scale) {
+    enforce(scale >= 0, "scale must not be negative");
+    int work = scale + 20;
+    BigInt term = pow10(work);
+    BigInt sum = term;
+    for (long k = 1; term != 0; k++) {
+        term /= k;
+        sum += term;
+    }
+    return bidRound(bid(false, sum, -work), scale);
+}
+
+// Number of digits before the decimal point, used to widen the working
+// precision so that reducing a large angle modulo 2*pi does not eat the
+// digits that were actually asked for.
+private int integerDigits(bid v) {
+    if (v.coefficient == 0) return 1;
+    int len = cast(int)v.coefficient.toDecimalString().length;
+    int whole = len + v.exponent;
+    return whole > 0 ? whole : 1;
+}
+
+// Brings an angle into [-pi, pi] by subtracting the nearest multiple of 2*pi.
+private bid reduceAngle(bid x, int work) {
+    bid twoPi = bidPi(work) * bid(2L);
+    bid turns = bidRound(x.divide(twoPi, work), 0);
+    return bidRound(x - turns * twoPi, work);
+}
+
+bid bidSin(bid x, int scale) {
+    int work = scale + 30 + integerDigits(x);
+    bid r = reduceAngle(x, work);
+    bid rsq = bidRound(r * r, work);
+    bid term = r, sum = r;
+    for (long k = 1; ; k++) {
+        // term_k = -term_{k-1} * r^2 / ((2k)(2k+1))
+        term = bidRound(term * rsq, work).divide(bid(2 * k * (2 * k + 1)), work);
+        term.negative = !term.negative && term.coefficient != 0;
+        if (term.coefficient == 0) break;
+        sum = bidRound(sum + term, work);
+    }
+    return bidRound(sum, scale);
+}
+
+bid bidCos(bid x, int scale) {
+    int work = scale + 30 + integerDigits(x);
+    bid r = reduceAngle(x, work);
+    bid rsq = bidRound(r * r, work);
+    bid term = bid(1L), sum = bid(1L);
+    for (long k = 1; ; k++) {
+        // term_k = -term_{k-1} * r^2 / ((2k-1)(2k))
+        term = bidRound(term * rsq, work).divide(bid((2 * k - 1) * (2 * k)), work);
+        term.negative = !term.negative && term.coefficient != 0;
+        if (term.coefficient == 0) break;
+        sum = bidRound(sum + term, work);
+    }
+    return bidRound(sum, scale);
+}
+
+bid bidTan(bid x, int scale) {
+    int work = scale + 25;
+    bid c = bidCos(x, work);
+    enforce(c.coefficient != 0, "bidTan is undefined where cos is zero");
+    return bidRound(bidSin(x, work).divide(c, work), scale);
+}
+
+// atan, reduced by the halving identity
+// atan(x) = 2*atan(x / (1 + sqrt(1 + x^2)))
+// until the argument is small enough for the series to converge quickly.
+bid bidAtan(bid x, int scale) {
+    int work = scale + 30;
+    bid one = bid(1L);
+    bid t = x;
+    int doublings = 0;
+    bid threshold = bid("0.05");
+    while (true) {
+        bid mag = t;
+        mag.negative = false;
+        if (mag <= threshold) break;
+        enforce(doublings < 200, "bidAtan failed to reduce the argument");
+        bid denom = one + bidSqrt(bidRound(one + t * t, work), work);
+        t = t.divide(denom, work);
+        doublings++;
+    }
+
+    bid tsq = bidRound(t * t, work);
+    bid term = t, sum = t;
+    for (long k = 1; ; k++) {
+        term = bidRound(term * tsq, work);
+        term.negative = !term.negative && term.coefficient != 0;
+        if (term.coefficient == 0) break;
+        bid piece = term.divide(bid(2 * k + 1), work);
+        if (piece.coefficient == 0) break;
+        sum = bidRound(sum + piece, work);
+    }
+
+    foreach (_; 0 .. doublings) sum = bidRound(sum * bid(2L), work);
+    return bidRound(sum, scale);
+}
+
+// asin(x) = atan(x / sqrt(1 - x^2)), with the endpoints handled directly.
+bid bidAsin(bid x, int scale) {
+    int work = scale + 25;
+    bid one = bid(1L);
+    bid mag = x;
+    mag.negative = false;
+    enforce(mag <= one, "bidAsin requires |x| <= 1");
+    if (mag == one) {
+        bid half = bidRound(bidPi(work).divide(bid(2L), work), scale);
+        half.negative = x.negative;
+        return half;
+    }
+    bid denom = bidSqrt(bidRound(one - x * x, work), work);
+    return bidRound(bidAtan(x.divide(denom, work), work), scale);
+}
+
+bid bidAcos(bid x, int scale) {
+    int work = scale + 25;
+    bid halfPi = bidPi(work).divide(bid(2L), work);
+    return bidRound(halfPi - bidAsin(x, work), scale);
+}
+
 // Horner evaluation, rounding after each step so the working precision
 // stays bounded instead of tripling with every multiply.
 private bid polyEval(bid[] coeffs, bid x, int scale) {
@@ -1174,6 +1323,12 @@ struct bid {
     bid log10(int scale) const { return bidLog10(this, scale); }
     bid log2(int scale) const { return bidLog2(this, scale); }
     bid log(bid base, int scale) const { return bidLog(base, this, scale); }
+    bid sin(int scale) const { return bidSin(this, scale); }
+    bid cos(int scale) const { return bidCos(this, scale); }
+    bid tan(int scale) const { return bidTan(this, scale); }
+    bid atan(int scale) const { return bidAtan(this, scale); }
+    bid asin(int scale) const { return bidAsin(this, scale); }
+    bid acos(int scale) const { return bidAcos(this, scale); }
 
     string toString() const {
         string sign = negative ? "-" : "";
@@ -1286,6 +1441,12 @@ struct dpd {
     dpd log(dpd base, int scale) const {
         return dpd.fromBid(bidLog(base.toBid(), toBid(), scale));
     }
+    dpd sin(int scale) const { return dpd.fromBid(bidSin(toBid(), scale)); }
+    dpd cos(int scale) const { return dpd.fromBid(bidCos(toBid(), scale)); }
+    dpd tan(int scale) const { return dpd.fromBid(bidTan(toBid(), scale)); }
+    dpd atan(int scale) const { return dpd.fromBid(bidAtan(toBid(), scale)); }
+    dpd asin(int scale) const { return dpd.fromBid(bidAsin(toBid(), scale)); }
+    dpd acos(int scale) const { return dpd.fromBid(bidAcos(toBid(), scale)); }
 
     // Packs digits into 10-bit declets, left-padding with zero digits
     // so the digit count is a multiple of 3.
@@ -1530,6 +1691,45 @@ unittest {
 
     // dpd gets the same logs.
     assert(dpd(2L).ln(40).toString() == bid(2L).ln(40).toString());
+
+    // Constants and trigonometry, against the known expansions.
+    assert(bidPi(50).toString()
+           == "3.14159265358979323846264338327950288419716939937511");
+    assert(bidE(50).toString()
+           == "2.71828182845904523536028747135266249775724709369996");
+    assert(bid(1L).sin(50).toString()
+           == "0.84147098480789650665250232163029899962256306079837");
+    assert(bid(1L).cos(50).toString()
+           == "0.54030230586813971740093660744297660373231042061792");
+    assert(bid(1L).tan(50).toString()
+           == "1.55740772465490223050697480745836017308725077238152");
+    assert(bid(1L).atan(50).toString()
+           == "0.78539816339744830961566084581987572104929234984378");
+
+    // Identities: sin(pi) == 0, cos(0) == 1, asin(1) == acos(0) == pi/2.
+    bid piVal = bidPi(40);
+    assert(bidSin(piVal, 30) == bid(0L));
+    assert(bid(0L).cos(30) == bid(1L));
+    assert(bidSin(piVal.divide(bid(2L), 40), 30) == bid(1L));
+    assert(bid(1L).asin(30) == piVal.divide(bid(2L), 30));
+    assert(bid(0L).acos(30) == piVal.divide(bid(2L), 30));
+
+    // sin^2 + cos^2 == 1, including at an angle far outside [-pi, pi]
+    // where the result depends on the modulo-2pi reduction holding up.
+    foreach (angle; [bid(1L), bid(1000L)]) {
+        bid sn = bidSin(angle, 50), cs = bidCos(angle, 50);
+        assert(bidRound(sn * sn + cs * cs, 45) == bid(1L));
+    }
+    // Computing the same large angle at two precisions must agree.
+    assert(bidSin(bid(1000L), 30) == bidRound(bidSin(bid(1000L), 60), 30));
+
+    // asin is only defined on [-1, 1].
+    bool outOfRange = false;
+    try { bid(2L).asin(10); } catch (Exception) { outOfRange = true; }
+    assert(outOfRange);
+
+    // dpd gets the same trigonometry.
+    assert(dpd(1L).sin(40).toString() == bid(1L).sin(40).toString());
 
     // Malformed input is rejected where it is written, not deep inside BigInt.
     foreach (text; ["1e100", "1.2.3", "abc", "12x"]) {
