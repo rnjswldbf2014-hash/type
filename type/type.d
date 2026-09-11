@@ -580,6 +580,60 @@ bid bidCbrt(bid v, int scale) {
     return bid(v.negative, icbrt(n), -scale);
 }
 
+// Natural logarithm to `scale` decimal places.
+//
+// Repeated square roots pull the argument towards 1, where the series
+// ln(x) = 2*artanh((x-1)/(x+1)) converges quickly; each halving is undone
+// by doubling the result, since ln(x^(1/2)) = ln(x)/2. Near 1 the ratio
+// z = (x-1)/(x+1) is around 0.005, so z^2 buys roughly 4-5 digits per term.
+bid bidLn(bid v, int scale) {
+    enforce(!v.negative && v.coefficient != 0,
+            "bidLn requires a strictly positive value");
+    int work = scale + 30;
+    bid one = bid(1L);
+
+    // Halve until |x - 1| is small enough for the series.
+    bid x = v;
+    int halvings = 0;
+    bid threshold = bid("0.01");
+    while (true) {
+        bid diff = x - one;
+        diff.negative = false; // magnitude
+        if (diff <= threshold) break;
+        enforce(halvings < 200, "bidLn failed to reduce the argument");
+        x = bidSqrt(x, work);
+        halvings++;
+    }
+
+    bid z = (x - one).divide(x + one, work);
+    bid zsq = bidRound(z * z, work);
+    bid sum = z;
+    bid term = z;
+    for (long k = 3; ; k += 2) {
+        term = bidRound(term * zsq, work);
+        if (term.coefficient == 0) break;
+        bid add = term.divide(bid(k), work);
+        if (add.coefficient == 0) break;
+        sum = bidRound(sum + add, work);
+    }
+
+    // ln(v) = 2^(halvings+1) * artanh-sum
+    bid result = sum;
+    foreach (_; 0 .. halvings + 1) result = bidRound(result * bid(2L), work);
+    return bidRound(result, scale);
+}
+
+// Logarithm of `v` in an arbitrary base, to `scale` decimal places.
+bid bidLog(bid base, bid v, int scale) {
+    enforce(!base.negative && base.coefficient != 0 && base != bid(1L),
+            "bidLog requires a positive base other than 1");
+    int work = scale + 20;
+    return bidRound(bidLn(v, work).divide(bidLn(base, work), work), scale);
+}
+
+bid bidLog10(bid v, int scale) { return bidLog(bid(10L), v, scale); }
+bid bidLog2(bid v, int scale) { return bidLog(bid(2L), v, scale); }
+
 // Horner evaluation, rounding after each step so the working precision
 // stays bounded instead of tripling with every multiply.
 private bid polyEval(bid[] coeffs, bid x, int scale) {
@@ -965,7 +1019,21 @@ struct bid {
         string fracPart = dot == -1 ? "" : str[dot + 1 .. $];
         exponent = -cast(int)fracPart.length;
         string digitsStr = intPart ~ fracPart;
-        coefficient = digitsStr.length ? BigInt(digitsStr) : BigInt(0);
+
+        // Reject anything BigInt would choke on further down, where the
+        // error would name an internal digit routine instead of the input.
+        // Exponent notation ("1e100") is deliberately not accepted: every
+        // digit of a bid is significant, so the value must be written out.
+        import std.ascii : isAsciiDigit = isDigit;
+        enforce(digitsStr.length, "bid: no digits in \"" ~ s ~ "\"");
+        enforce(fracPart.indexOf('.') == -1,
+                "bid: more than one decimal point in \"" ~ s ~ "\"");
+        foreach (ch; digitsStr)
+            enforce(isAsciiDigit(ch),
+                    "bid: \"" ~ s ~ "\" is not a plain decimal number"
+                    ~ " (exponent notation is not supported)");
+
+        coefficient = BigInt(digitsStr);
         if (coefficient == 0) negative = false;
     }
 
@@ -1045,10 +1113,14 @@ struct bid {
         return divide(bid(rhs), scale);
     }
 
-    // Arbitrary-precision roots and rounding, callable directly on a value.
+    // Arbitrary-precision roots, logs and rounding, callable on a value.
     bid sqrt(int scale) const { return bidSqrt(this, scale); }
     bid cbrt(int scale) const { return bidCbrt(this, scale); }
     bid round(int scale) const { return bidRound(this, scale); }
+    bid ln(int scale) const { return bidLn(this, scale); }
+    bid log10(int scale) const { return bidLog10(this, scale); }
+    bid log2(int scale) const { return bidLog2(this, scale); }
+    bid log(bid base, int scale) const { return bidLog(base, this, scale); }
 
     string toString() const {
         string sign = negative ? "-" : "";
@@ -1151,10 +1223,16 @@ struct dpd {
         return divide(dpd(rhs), scale);
     }
 
-    // Arbitrary-precision roots and rounding, without hopping through bid.
+    // Arbitrary-precision roots, logs and rounding, without hopping through bid.
     dpd sqrt(int scale) const { return dpd.fromBid(bidSqrt(toBid(), scale)); }
     dpd cbrt(int scale) const { return dpd.fromBid(bidCbrt(toBid(), scale)); }
     dpd round(int scale) const { return dpd.fromBid(bidRound(toBid(), scale)); }
+    dpd ln(int scale) const { return dpd.fromBid(bidLn(toBid(), scale)); }
+    dpd log10(int scale) const { return dpd.fromBid(bidLog10(toBid(), scale)); }
+    dpd log2(int scale) const { return dpd.fromBid(bidLog2(toBid(), scale)); }
+    dpd log(dpd base, int scale) const {
+        return dpd.fromBid(bidLog(base.toBid(), toBid(), scale));
+    }
 
     // Packs digits into 10-bit declets, left-padding with zero digits
     // so the digit count is a multiple of 3.
@@ -1339,6 +1417,49 @@ unittest {
         bid t = root.toBid();
         bid ft = t * t * t * t - t * t * t - t * t - t - bid(1L);
         assert(ft.round(33) == bid(0L));
+    }
+
+    // Logarithms, against the known expansions.
+    // ln 2  = 0.693147180559945309417232121458176568075500134360255254...
+    // ln 10 = 2.302585092994045684017991454684364207601101488628772976...
+    // log10 2 = 0.301029995663981195213738894724493026768189881462108541...
+    assert(bid(2L).ln(50).toString()
+           == "0.69314718055994530941723212145817656807550013436026");
+    assert(bid(10L).ln(50).toString()
+           == "2.30258509299404568401799145468436420760110148862877");
+    assert(bid(2L).log10(50).toString()
+           == "0.30102999566398119521373889472449302676818988146211");
+
+    // Exact cases land exactly.
+    assert(bid(1L).ln(40) == bid(0L));
+    assert(bid(1000L).log10(40) == bid(3L));
+    assert(bid(1024L).log2(40) == bid(10L));
+    assert(bid(81L).log(bid(3L), 40) == bid(4L));
+
+    // ln(10^100) == 100*ln(10), and logs below 1 come back negative.
+    bid tenTo100 = bid(1L);
+    foreach (_; 0 .. 100) tenTo100 = tenTo100 * bid(10L);
+    assert(tenTo100.ln(30) == (bid(10L).ln(40) * bid(100L)).round(30));
+    assert(bid("0.001").ln(30) == (bid(10L).ln(40) * bid(-3L)).round(30));
+
+    // Logs are defined only for positive values, in any base but 1.
+    foreach (bad; [bid(0L), bid(-1L)]) {
+        bool caught = false;
+        try { bad.ln(10); } catch (Exception) { caught = true; }
+        assert(caught);
+    }
+    bool badBase = false;
+    try { bid(8L).log(bid(1L), 10); } catch (Exception) { badBase = true; }
+    assert(badBase);
+
+    // dpd gets the same logs.
+    assert(dpd(2L).ln(40).toString() == bid(2L).ln(40).toString());
+
+    // Malformed input is rejected where it is written, not deep inside BigInt.
+    foreach (text; ["1e100", "1.2.3", "abc", "12x"]) {
+        bool caught = false;
+        try { bid(text); } catch (Exception) { caught = true; }
+        assert(caught, text);
     }
 
     // sqrt/cbrt/round are callable straight off a value, on both types.
