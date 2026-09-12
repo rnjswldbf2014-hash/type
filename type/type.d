@@ -16,7 +16,7 @@ double getDouble(T)(T v) {
     static if (isNumeric!UT) return to!double(v);
     else static if (is(UT == fra)) return bigRatioToDouble(v.num, v.den);
     else static if (is(UT == dfloat)) return v.val;
-    else static if (is(UT == dec)) return v.val;
+    else static if (is(UT == dec)) return getDouble(v.value);
     else static if (is(UT == posit)) return v.val;
     else static if (is(UT == bid) || is(UT == dpd)) return to!double(v.toString());
     else return 0.0;
@@ -31,6 +31,8 @@ fra getFra(T)(T v) {
         return fra.exactFrom(v);
     } else static if (is(UT == dpd)) {
         return fra.exactFrom(v.toBid());
+    } else static if (is(UT == dec)) {
+        return fra.exactFrom(v.value);
     } else {
         // Very basic float to fraction conversion by multiplying by 1000000
         double d = getDouble(v);
@@ -214,15 +216,31 @@ void comden(ref fra a, ref fra b) {
     b.den = d;
 }
 
-// 3. dfloat
+// 3. dfloat -- a binary float whose width is chosen at runtime.
+//
+// `precisionBytes` selects the stored precision: 4 rounds through float,
+// 8 and 10 keep the double as given. Every operation re-rounds to that
+// width, so a dfloat with precisionBytes == 4 really does carry float
+// precision rather than merely claiming to. Note that the width can only
+// narrow a value -- the input is already a double, so 10 cannot recover
+// precision that was never there.
 struct dfloat {
     double val;
     long precisionBytes = 8;
-    
-    this(double v) {
-        val = v;
+
+    this(double v, long bytes = 8) {
+        enforce(bytes == 4 || bytes == 8 || bytes == 10,
+                "dfloat precisionBytes must be 4, 8 or 10");
+        precisionBytes = bytes;
+        val = roundToWidth(v, bytes);
     }
-    
+
+    static double roundToWidth(double v, long bytes) {
+        if (bytes == 4) return cast(double)cast(float)v;
+        if (bytes == 10) return cast(double)cast(real)v;
+        return v;
+    }
+
     string toString() const {
         return to!string(val);
     }
@@ -232,59 +250,167 @@ struct dfloat {
             return getFra(this).opBinary!op(rhs);
         } else {
             double r = getDouble(rhs);
-            mixin("return dfloat(val " ~ op ~ " r);");
+            mixin("return dfloat(val " ~ op ~ " r, precisionBytes);");
         }
     }
 }
 
-// 4. dec
+// 4. dec -- a decimal value stored in one of the two IEEE 754-2008
+// encodings, chosen by `mode`.
+//
+// "bid" keeps the coefficient as a binary integer; "dpd" packs the digits
+// into 10-bit declets. Both hold the same value exactly, so arithmetic is
+// exact either way -- the mode decides the representation, which is the
+// distinction the field was named for.
 struct dec {
     string mode;
-    double val;
-    
-    this(double v, string m = "dpd") {
-        val = v;
+    bid value;
+
+    this(string v, string m = "bid") { this(bid(v), m); }
+    this(long v, string m = "bid") { this(bid(v), m); }
+    this(double v, string m = "bid") { this(bid(v), m); }
+
+    this(bid v, string m = "bid") {
+        enforce(m == "bid" || m == "dpd", "dec mode must be \"bid\" or \"dpd\"");
         mode = m;
+        // Round-tripping through dpd storage is lossless, but doing it keeps
+        // the declet form the live representation when that mode is asked for.
+        value = (m == "dpd") ? dpd.fromBid(v).toBid() : v;
     }
-    
+
+    // The declet-packed form, for mode == "dpd".
+    ushort[] declets() const {
+        enforce(mode == "dpd", "declets() requires mode \"dpd\"");
+        return dpd.fromBid(value).pack();
+    }
+
     string toString() const {
-        return to!string(val) ~ "(" ~ mode ~ ")";
+        return value.toString() ~ "(" ~ mode ~ ")";
+    }
+
+    dec opBinary(string op, R)(R rhs) const
+            if (op == "+" || op == "-" || op == "*") {
+        static if (is(Unqual!R == dec)) {
+            return dec(mixin("value " ~ op ~ " rhs.value"), mode);
+        } else {
+            return dec(mixin("value " ~ op ~ " bid(rhs)"), mode);
+        }
+    }
+
+    dec divide(dec rhs, int scale) const {
+        return dec(value.divide(rhs.value, scale), mode);
+    }
+
+    int opCmp(dec rhs) const { return value.opCmp(rhs.value); }
+    bool opEquals(dec rhs) const { return value == rhs.value; }
+}
+
+// 5. posit -- the real Type III unum format, not a double in disguise.
+//
+// A posit is sign + regime + exponent + fraction, where the regime is a
+// unary run whose length trades away fraction bits: values near 1 get the
+// most precision and it tapers towards the extremes. `es` is 2, per the
+// 2022 standard. Encodings are two's complement, so a pattern read as a
+// signed integer orders exactly as the value it represents -- which is
+// what lets positEncode binary-search for the nearest representable value.
+
+enum positES = 2; // exponent bits, fixed by the standard
+
+// Decodes a posit bit pattern. Returns NaN for NaR, the format's single
+// exception value (there is no separate infinity and no signed zero).
+double positDecode(ulong pattern, int nbits) {
+    enforce(nbits >= 2 && nbits <= 32, "posit width must be 2..32 bits");
+    ulong mask = (1UL << nbits) - 1;
+    ulong p = pattern & mask;
+
+    if (p == 0) return 0.0;
+    if (p == (1UL << (nbits - 1))) return double.nan; // NaR
+
+    bool neg = (p >> (nbits - 1)) != 0;
+    if (neg) p = (-cast(long)p) & cast(long)mask; // two's complement
+
+    // Walk the bits below the sign, most significant first.
+    int pos = nbits - 2;
+    bool first = ((p >> pos) & 1) != 0;
+    int run = 0;
+    while (pos >= 0 && (((p >> pos) & 1) != 0) == first) { run++; pos--; }
+    int k = first ? run - 1 : -run;
+    pos--; // skip the terminating bit (may fall off the end)
+
+    long e = 0;
+    foreach (_; 0 .. positES) {
+        e <<= 1;
+        if (pos >= 0) { e |= (p >> pos) & 1; pos--; }
+    }
+
+    double frac = 0.0, weight = 0.5;
+    while (pos >= 0) {
+        if (((p >> pos) & 1) != 0) frac += weight;
+        weight /= 2.0;
+        pos--;
+    }
+
+    double scaled = (1.0 + frac) * (2.0 ^^ cast(double)(k * (1 << positES) + e));
+    return neg ? -scaled : scaled;
+}
+
+// Encodes the nearest representable posit, ties to even, by binary search
+// over the signed-integer ordering of the encodings.
+ulong positEncode(double v, int nbits) {
+    enforce(nbits >= 2 && nbits <= 32, "posit width must be 2..32 bits");
+    ulong mask = (1UL << nbits) - 1;
+    if (isNaN(v)) return 1UL << (nbits - 1);          // NaR
+    if (v == 0.0) return 0;
+
+    long lo = -(1L << (nbits - 1)) + 1;               // most negative real
+    long hi = (1L << (nbits - 1)) - 1;                // most positive real
+    ulong asPattern(long i) { return cast(ulong)i & mask; }
+
+    if (v <= positDecode(asPattern(lo), nbits)) return asPattern(lo);
+    if (v >= positDecode(asPattern(hi), nbits)) return asPattern(hi);
+
+    // Largest encoding whose value is <= v.
+    while (lo < hi) {
+        long mid = lo + (hi - lo + 1) / 2;
+        if (positDecode(asPattern(mid), nbits) <= v) lo = mid;
+        else hi = mid - 1;
+    }
+
+    double below = positDecode(asPattern(lo), nbits);
+    double above = positDecode(asPattern(lo + 1), nbits);
+    double dLo = v - below, dHi = above - v;
+    if (dLo < dHi) return asPattern(lo);
+    if (dHi < dLo) return asPattern(lo + 1);
+    return (lo & 1) == 0 ? asPattern(lo) : asPattern(lo + 1); // tie to even
+}
+
+struct posit {
+    int bits;
+    double val; // the value after rounding onto the posit grid
+
+    this(double v, int b = 32) {
+        enforce(b >= 2 && b <= 32, "posit width must be 2..32 bits");
+        bits = b;
+        val = positDecode(positEncode(v, b), b);
+    }
+
+    // The stored bit pattern.
+    ulong encoding() const { return positEncode(val, bits); }
+
+    bool isNaR() const { return isNaN(val); }
+
+    string toString() const {
+        return "posit" ~ to!string(bits) ~ ":" ~ (isNaR() ? "NaR" : to!string(val));
     }
 
     auto opBinary(string op, R)(R rhs) const {
         static if (is(Unqual!R == fra)) {
             return getFra(this).opBinary!op(rhs);
         } else static if (is(Unqual!R == dfloat)) {
-            return dfloat(this.val).opBinary!op(rhs); // Prioritize dfloat
-        } else {
             double r = getDouble(rhs);
-            mixin("return dec(val " ~ op ~ " r, mode);");
-        }
-    }
-}
-
-// 5. posit
-struct posit {
-    int bits;
-    double val;
-    
-    this(double v, int b = 32) {
-        val = v;
-        bits = b;
-    }
-    
-    string toString() const {
-        return "posit" ~ to!string(bits) ~ ":" ~ to!string(val);
-    }
-
-    auto opBinary(string op, R)(R rhs) const {
-         static if (is(Unqual!R == fra)) {
-            return getFra(this).opBinary!op(rhs);
-        } else static if (is(Unqual!R == dfloat) || is(Unqual!R == dec)) {
-            // Prioritize higher precision / dfloat
-            double r = getDouble(rhs);
-            mixin("return dfloat(val " ~ op ~ " r);");
+            mixin("return dfloat(val " ~ op ~ " r, rhs.precisionBytes);");
         } else {
+            // Compute exactly in double, then round back onto the grid.
             double r = getDouble(rhs);
             mixin("return posit(val " ~ op ~ " r, bits);");
         }
@@ -1730,6 +1856,76 @@ unittest {
 
     // dpd gets the same trigonometry.
     assert(dpd(1L).sin(40).toString() == bid(1L).sin(40).toString());
+
+    // posit: the bit patterns the format specifies.
+    assert(positDecode(0b01000000, 8) == 1.0);
+    assert(positDecode(0b11000000, 8) == -1.0);
+    assert(positDecode(0b00111000, 8) == 0.5);
+    assert(positDecode(0b00000001, 8) == 2.0 ^^ -24.0);
+    assert(positDecode(0, 8) == 0.0);
+    assert(isNaN(positDecode(0b10000000, 8)));
+
+    // Every 8-bit encoding round-trips, and the encodings are monotonic in
+    // their signed-integer order -- the property positEncode's search relies
+    // on. Checked exhaustively here, and for 16 bits too.
+    double previous = -double.infinity;
+    foreach (long i; -127 .. 128) {
+        ulong pattern = cast(ulong)i & 0xFF;
+        double value = positDecode(pattern, 8);
+        assert(value > previous);
+        assert(positEncode(value, 8) == pattern);
+        previous = value;
+    }
+    previous = -double.infinity;
+    foreach (long i; -32767 .. 32768) {
+        double value = positDecode(cast(ulong)i & 0xFFFF, 16);
+        assert(value > previous);
+        previous = value;
+    }
+
+    // Values are rounded onto the grid, and narrower posits are coarser --
+    // the tapered precision that makes this a posit and not a double.
+    assert(posit(1.0, 8).val == 1.0);       // exactly on the grid
+    assert(posit(0.5, 8).val == 0.5);
+    // 0.1 is not a dyadic rational, so no width holds it exactly -- but a
+    // wider posit must land strictly closer to it.
+    double e8 = abs(posit(0.1, 8).val - 0.1);
+    double e16 = abs(posit(0.1, 16).val - 0.1);
+    double e32 = abs(posit(0.1, 32).val - 0.1);
+    assert(e8 > e16 && e16 > e32 && e32 > 0);
+    assert(posit(0.1, 8).encoding() == 0x25);
+    assert(posit(double.nan, 16).isNaR());
+
+    // dfloat: the width is real, and it survives arithmetic.
+    // Compared by property rather than against cast(double)cast(float)0.1,
+    // which the compiler folds without actually narrowing to float.
+    double narrowed = dfloat(0.1, 4).val;
+    assert(narrowed != 0.1);                        // precision really dropped
+    assert(dfloat(narrowed, 4).val == narrowed);    // already on the float grid
+    assert(dfloat(0.1, 8).val == 0.1);              // 8 leaves the double alone
+    assert(dfloat(0.1, 4).val != dfloat(0.1, 8).val);
+    assert((dfloat(0.1, 4) + dfloat(0.2, 4)).precisionBytes == 4);
+    bool badWidth = false;
+    try { dfloat(1.0, 5); } catch (Exception) { badWidth = true; }
+    assert(badWidth);
+
+    // dec: exact decimal arithmetic in either encoding, and mode chooses
+    // the representation rather than just labelling it.
+    assert(dec("0.1").value == bid("0.1"));
+    assert((dec("0.1", "dpd") + dec("0.2", "dpd")).value == bid("0.3"));
+    assert(dec("1").divide(dec("7"), 21).value.toString()
+           == "0.142857142857142857143");
+    assert(dec("0.1", "bid") == dec("0.1", "dpd"));   // same value either way
+    assert(dec("0.1", "dpd").declets() == dpd("0.1").pack());
+    bool badMode = false;
+    try { dec("1", "xyz"); } catch (Exception) { badMode = true; }
+    assert(badMode);
+    bool noDeclets = false;
+    try { dec("1", "bid").declets(); } catch (Exception) { noDeclets = true; }
+    assert(noDeclets);
+
+    // dec converts to a fraction exactly, not through the 1/1000000 path.
+    assert((fra(1, 2) + dec("0.25")) == fra(3, 4));
 
     // Malformed input is rejected where it is written, not deep inside BigInt.
     foreach (text; ["1e100", "1.2.3", "abc", "12x"]) {
