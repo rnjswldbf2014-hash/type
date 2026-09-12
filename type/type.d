@@ -359,7 +359,12 @@ double positDecode(ulong pattern, int nbits) {
 ulong positEncode(double v, int nbits) {
     enforce(nbits >= 2 && nbits <= 32, "posit width must be 2..32 bits");
     ulong mask = (1UL << nbits) - 1;
-    if (isNaN(v)) return 1UL << (nbits - 1);          // NaR
+    // The format has one exception value and no infinity, so anything that
+    // is not a real number -- including the infinity a division by zero
+    // produces -- encodes as NaR. A merely oversized finite value is a
+    // different case: posits saturate to maxpos rather than overflowing,
+    // which the clamping below does.
+    if (isNaN(v) || isInfinity(v)) return 1UL << (nbits - 1);
     if (v == 0.0) return 0;
 
     long lo = -(1L << (nbits - 1)) + 1;               // most negative real
@@ -1895,6 +1900,28 @@ unittest {
     assert(e8 > e16 && e16 > e32 && e32 > 0);
     assert(posit(0.1, 8).encoding() == 0x25);
     assert(posit(double.nan, 16).isNaR());
+
+    // maxpos/minpos are useed^(n-2) and its reciprocal, useed being 2^2^es.
+    foreach (width; [8, 16]) {
+        assert(positDecode((1UL << (width - 1)) - 1, width)
+               == 16.0 ^^ cast(double)(width - 2));
+        assert(positDecode(1, width) == 16.0 ^^ cast(double)(-(width - 2)));
+    }
+
+    // Negating a value two's-complements its encoding, across all 8-bit ones.
+    foreach (long i; -127 .. 128) {
+        ulong pattern = cast(ulong)i & 0xFF;
+        double value = positDecode(pattern, 8);
+        if (value == 0) continue;
+        assert(positEncode(-value, 8) == ((-cast(long)pattern) & 0xFF));
+    }
+
+    // The format has no infinity: dividing by zero is NaR, and NaR
+    // propagates. An oversized *finite* value is different -- it saturates.
+    assert((posit(1.0, 16) / posit(0.0, 16)).isNaR());
+    assert(positEncode(double.infinity, 16) == 0x8000);
+    assert((posit(double.nan, 16) + posit(1.0, 16)).isNaR());
+    assert(posit(1e30, 16).val == positDecode(0x7FFF, 16)); // maxpos, not NaR
 
     // dfloat: the width is real, and it survives arithmetic.
     // Compared by property rather than against cast(double)cast(float)0.1,
